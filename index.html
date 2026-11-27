@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>バーコード読み取り</title>
+<!--
+  バーコード読み取り専用アプリ（2026-11-27）
+  ・進捗管理アプリ（社内 http）の「読み取り」から  …/index.html#return=<戻り先URL>  で開かれる（?return= でも可）
+  ・開いたらすぐカメラを映し、1次元バーコード・QR を自動で読む。数字だけのものを読めたら「ピッ」と鳴らし、戻り先に ?seiban=<数字> を付けて戻る
+  ・キャンセルは番号なしで戻る
+  ・戻り先は ALLOW（http://172.17.3.99:8765）だけ。それ以外には飛ばない
+  ・読み取りは端末の中だけ（zxing-wasm。js と wasm はこのフォルダに同梱。番号はどこにも送らない）
+  ・カメラを使うため https で配る。静的ファイル（このフォルダ）だけで動く
+-->
+<style>
+  :root {
+    --bg: #0f172a; --ink: #ffffff; --sub: #cbd5e1; --ok: #34d399; --okInk: #052e16;
+    --btn: #ffffff; --btnInk: #1a1a1c; --focus: #ffd43d; --err: #fecaca;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: "Noto Sans JP", "Hiragino Sans", "Meiryo UI", sans-serif; }
+  body { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+  header { padding: max(12px, env(safe-area-inset-top)) 16px 12px; }
+  h1 { margin: 0; font-size: 20px; line-height: 1.5; font-weight: 700; }
+  .cam { flex: 1; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; background: #000; }
+  video { width: 100%; height: 100%; object-fit: cover; }
+  .frame { position: absolute; width: min(84vw, 680px); height: min(32vh, 240px); border: 4px solid var(--ok); border-radius: 16px;
+    box-shadow: 0 0 0 9999px rgba(0, 0, 0, .40); pointer-events: none; transition: border-width .1s; }
+  .frame.hit { border-width: 10px; border-color: #fbbf24; }
+  footer { padding: 12px 16px max(16px, env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 12px; }
+  #msg { margin: 0; font-size: 18px; line-height: 1.6; min-height: 1.6em; }
+  #msg.err { color: var(--err); }
+  #msg.ok { color: var(--ok); font-weight: 700; }
+  #cancel { width: 100%; min-height: 64px; border: 0; border-radius: 12px; background: var(--btn); color: var(--btnInk);
+    font-size: 22px; font-weight: 700; font-family: inherit; cursor: pointer; }
+  #cancel:active { background: #e5e7eb; }
+  #cancel:focus-visible { outline: 4px solid var(--focus); outline-offset: 3px; }
+  @media (min-width: 768px) { footer { flex-direction: row; align-items: center; } #msg { flex: 1; } #cancel { width: 280px; } }
+</style>
+</head>
+<body>
+<header><h1>指示書のバーコードを枠に写してください</h1></header>
+<div class="cam">
+  <video id="v" playsinline muted autoplay aria-label="カメラの映像"></video>
+  <div class="frame" id="frame" aria-hidden="true"></div>
+</div>
+<footer>
+  <p id="msg" role="status" aria-live="polite">カメラを起動しています…</p>
+  <button id="cancel" type="button">キャンセル（戻る）</button>
+</footer>
+<script src="zxing-reader.js"></script>
+<script>
+(function () {
+  'use strict';
+  // ---- 設定 ----
+  var ALLOW = ['http://172.17.3.99:8765'];   // 戻ってよい先（これ以外には飛ばない）
+  var FORMATS = ['EAN8', 'EAN13', 'UPCA', 'UPCE', 'Code128', 'Code39', 'Code93', 'ITF', 'Codabar', 'QRCode'];
+  var CHECKED = { EAN8: 1, EAN13: 1, UPCA: 1, UPCE: 1, QRCode: 1 };   // 確認の仕組みがある形は1回で決める。ほかは2回続けて同じ数字なら決める
+
+  var v = document.getElementById('v'), msg = document.getElementById('msg'), frame = document.getElementById('frame');
+  var cv = document.createElement('canvas'), ctx = cv.getContext('2d', { willReadFrequently: true });
+  var stream = null, done = false, last = '', lastN = 0, ac = null, timer = 0;
+
+  function say(t, cls) { msg.textContent = t; msg.className = cls || ''; }
+
+  // ---- 戻り先 ----
+  function getReturn() {
+    var h = new URLSearchParams(location.hash.replace(/^#/, '')), q = new URLSearchParams(location.search);
+    var r = h.get('return') || q.get('return');
+    if (!r) return null;
+    var u; try { u = new URL(r); } catch (e) { return null; }
+    if (ALLOW.indexOf(u.origin) < 0) return null;   // javascript: などは origin が "null" になるのでここで外れる
+    u.hash = ''; u.searchParams.delete('seiban');
+    return u;
+  }
+  var ret = getReturn();
+  var canBack = new URLSearchParams(location.hash.replace(/^#/, '')).get('back') === '1';
+
+  function stopCam() {
+    clearTimeout(timer);
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+  }
+  function goBack(seiban) {
+    done = true; stopCam();
+    if (seiban != null) {
+      var u = new URL(ret.href); u.searchParams.set('seiban', seiban);
+      location.replace(u.href);   // 読み取り画面は「戻る」の履歴に残さない
+      return;
+    }
+    // キャンセル：進捗管理の「読み取り」から来たとき（#back=1）は「戻る」で前の画面へ（開き直さないので速い）。
+    //   それ以外（ブックマークなど）は戻り先を開く
+    if (canBack && history.length > 1) { history.back(); if (ret) setTimeout(function () { location.replace(ret.href); }, 800); }
+    else if (ret) location.replace(ret.href);
+    else say('戻り先がありません。この画面を閉じてください。', 'err');
+  }
+  document.getElementById('cancel').addEventListener('click', function () { goBack(null); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') goBack(null); });
+
+  // ---- 音（読めたら「ピッ」）----
+  function audioPrep() {
+    try { var A = window.AudioContext || window.webkitAudioContext; if (A && !ac) ac = new A(); if (ac && ac.state !== 'running') ac.resume(); } catch (e) { }
+  }
+  document.addEventListener('pointerdown', audioPrep, true);   // 画面を触ったら必ず鳴らせるようにする
+  function beep() {
+    try {
+      audioPrep();
+      if (!ac) return;
+      var o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+      o.type = 'square'; o.frequency.value = 2000;
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+      o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + 0.16);
+    } catch (e) { }
+  }
+
+  // ---- 読み取り ----
+  function found(text, format) {
+    text = String(text || '').trim();
+    if (!/^\d+$/.test(text)) { say('数字以外のコードです（読み取りません）：' + text.slice(0, 30), 'err'); return false; }
+    if (text === last) lastN++; else { last = text; lastN = 1; }
+    if (!CHECKED[format] && lastN < 2) return false;
+    done = true;
+    beep();
+    frame.classList.add('hit');
+    say('読み取りました：' + text, 'ok');
+    stopCam();
+    setTimeout(function () { goBack(text); }, 350);   // 音と枠の色を一瞬見せてから戻る
+    return true;
+  }
+  function loop() {
+    if (done || !stream) return;
+    if (v.readyState < 2 || !v.videoWidth) { timer = setTimeout(loop, 60); return; }
+    // 画面の真ん中（枠のあたり：横 9 割・縦 7 割）を、カメラの細かさのまま（長い辺 1920 まで）読む
+    var W = v.videoWidth, H = v.videoHeight, sx = W * 0.05, sy = H * 0.15, sw = W * 0.9, sh = H * 0.7;
+    var k = Math.min(1, 1920 / Math.max(sw, sh)), w = Math.round(sw * k), h = Math.round(sh * k);
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    ctx.drawImage(v, sx, sy, sw, sh, 0, 0, w, h);
+    var img = ctx.getImageData(0, 0, w, h);
+    ZXingWASM.readBarcodes(img, { formats: FORMATS, tryHarder: true, tryRotate: true, tryInvert: false, maxNumberOfSymbols: 1 }).then(function (rs) {
+      if (done) return;
+      for (var i = 0; i < rs.length; i++) if (rs[i].isValid && found(rs[i].text, rs[i].format)) return;
+      timer = setTimeout(loop, 30);
+    }).catch(function (e) {
+      say('読み取りの準備に失敗しました：' + (e && e.message || e), 'err');
+      timer = setTimeout(loop, 1000);
+    });
+  }
+
+  function start() {
+    if (!ret) { say('進捗管理アプリの「読み取り」から開いてください（戻り先が正しくありません）。', 'err'); return; }
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      say('この開き方ではカメラを使えません（https で開いてください）。', 'err'); return;
+    }
+    if (!window.ZXingWASM) { say('読み取りの部品（zxing-reader.js）を読み込めませんでした。', 'err'); return; }
+    audioPrep();
+    // wasm はこのフォルダのものを使う（CDN から取らない）
+    var wasmReady = ZXingWASM.prepareZXingModule({
+      overrides: { locateFile: function (path, prefix) { return /\.wasm$/.test(path) ? new URL('zxing_reader.wasm', location.href).href : prefix + path; } },
+      fireImmediately: true
+    });
+    var camReady = navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+    });
+    camReady.then(function (st) {
+      if (done) { st.getTracks().forEach(function (t) { t.stop(); }); return; }
+      stream = st; v.srcObject = st;
+      var p = v.play(); if (p && p.catch) p.catch(function () { });
+      say('バーコードを枠に写すと、自動で読み取ります');
+      return wasmReady;
+    }).then(function () { if (stream && !done) loop(); }).catch(function (e) {
+      var n = e && e.name;
+      say(n === 'NotAllowedError' ? 'カメラの使用が許可されていません。iPad の 設定 → アプリ → Safari → カメラ を「許可」にしてください。'
+        : n === 'NotFoundError' ? 'カメラが見つかりません。'
+        : 'カメラまたは読み取りの準備ができません：' + (e && e.message || e), 'err');
+    });
+  }
+  // 別の画面へ移るときはカメラを止める。戻る/進むで残っていた画面が出たときは開き直す
+  window.addEventListener('pagehide', stopCam);
+  window.addEventListener('pageshow', function (e) { if (e.persisted) location.reload(); });
+  start();
+})();
+</script>
+</body>
+</html>
